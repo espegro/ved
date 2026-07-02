@@ -41,6 +41,14 @@ clear_screen:
     .ascii "\033[2J\033[H"
 clear_screen_len = . - clear_screen
 
+hide_cursor:
+    .ascii "\033[?25l"
+hide_cursor_len = . - hide_cursor
+
+show_cursor:
+    .ascii "\033[?25h"
+show_cursor_len = . - show_cursor
+
 status_normal:
     .ascii "\033[7m NORMAL  "
 status_normal_len = . - status_normal
@@ -185,6 +193,8 @@ cursor:
 # mode: 0 = normal, 1 = insert, 2 = command-line.
 mode:
     .quad 0
+insert_undo_saved:
+    .quad 0
 
 # Dirty means the buffer has unsaved changes.
 dirty:
@@ -192,8 +202,6 @@ dirty:
 
 # Temporary state for vertical movement and two-key commands such as dd.
 last_col:
-    .quad 0
-delete_pending:
     .quad 0
 op_pending:
     .quad 0
@@ -491,6 +499,9 @@ raw_flags:
 
 # Restore the terminal settings that were active when the editor started.
 disable_raw:
+    mov rsi, offset show_cursor
+    mov rdx, show_cursor_len
+    call write_stdout
     mov rax, SYS_IOCTL
     mov rdi, 0
     mov rsi, TCSETS
@@ -687,8 +698,7 @@ normal_insert:
     mov qword ptr [op_pending], 0
     mov qword ptr [g_pending], 0
     call clear_count
-    mov qword ptr [mode], 1
-    ret
+    jmp enter_insert_mode
 
 normal_append:
     mov rax, [cursor]
@@ -699,8 +709,7 @@ append_mode_set:
     mov qword ptr [op_pending], 0
     mov qword ptr [g_pending], 0
     call clear_count
-    mov qword ptr [mode], 1
-    ret
+    jmp enter_insert_mode
 
 normal_append_line:
     call move_line_end
@@ -728,8 +737,7 @@ open_before_newline:
     mov qword ptr [op_pending], 0
     mov qword ptr [g_pending], 0
     call clear_count
-    mov qword ptr [mode], 1
-    ret
+    jmp enter_insert_mode_undo_saved
 open_at_end:
     mov [cursor], rbx
     cmp rbx, 0
@@ -740,12 +748,15 @@ open_at_end:
     je open_empty
     mov al, 10
     call insert_byte
+    mov qword ptr [op_pending], 0
+    mov qword ptr [g_pending], 0
+    call clear_count
+    jmp enter_insert_mode_undo_saved
 open_empty:
     mov qword ptr [op_pending], 0
     mov qword ptr [g_pending], 0
     call clear_count
-    mov qword ptr [mode], 1
-    ret
+    jmp enter_insert_mode
 
 # Open a new line above the current line and enter insert mode.
 normal_open_above:
@@ -765,8 +776,7 @@ open_above_at_start:
     mov qword ptr [op_pending], 0
     mov qword ptr [g_pending], 0
     call clear_count
-    mov qword ptr [mode], 1
-    ret
+    jmp enter_insert_mode_undo_saved
 open_above_at_line_start:
     mov [cursor], rbx
     mov al, 10
@@ -775,8 +785,7 @@ open_above_at_line_start:
     mov qword ptr [op_pending], 0
     mov qword ptr [g_pending], 0
     call clear_count
-    mov qword ptr [mode], 1
-    ret
+    jmp enter_insert_mode_undo_saved
 
 start_command:
     mov qword ptr [op_pending], 0
@@ -797,6 +806,16 @@ start_search:
 clear_count:
     mov qword ptr [count_accum], 0
     mov qword ptr [count_active], 0
+    ret
+
+enter_insert_mode:
+    mov qword ptr [insert_undo_saved], 0
+    mov qword ptr [mode], 1
+    ret
+
+enter_insert_mode_undo_saved:
+    mov qword ptr [insert_undo_saved], 1
+    mov qword ptr [mode], 1
     ret
 
 get_count_or_one:
@@ -858,6 +877,20 @@ save_undo_fail:
     pop r10
     pop r9
     pop r8
+    ret
+
+save_insert_undo_once:
+    cmp qword ptr [insert_undo_saved], 0
+    jne save_insert_undo_done
+    call save_undo
+    mov qword ptr [insert_undo_saved], 1
+save_insert_undo_done:
+    ret
+
+save_edit_undo:
+    cmp qword ptr [mode], 1
+    je save_insert_undo_once
+    call save_undo
     ret
 
 undo_last_change:
@@ -1011,8 +1044,7 @@ change_line_make_blank_store:
     inc qword ptr [buf_len]
     mov [cursor], r8
     mov qword ptr [dirty], 1
-    mov qword ptr [mode], 1
-    ret
+    jmp enter_insert_mode_undo_saved
 
 delete_to_line_end:
     call clear_count
@@ -1030,18 +1062,23 @@ delete_to_line_end:
     pop r9
     pop r8
     call delete_range
+    mov rax, 1
+    ret
 delete_to_line_end_done:
+    xor rax, rax
     ret
 
 change_to_line_end:
     call delete_to_line_end
-    mov qword ptr [mode], 1
-    ret
+    cmp rax, 1
+    je change_to_line_end_keep_undo
+    jmp enter_insert_mode
+change_to_line_end_keep_undo:
+    jmp enter_insert_mode_undo_saved
 
 substitute_char_counted:
     call delete_char_counted
-    mov qword ptr [mode], 1
-    ret
+    jmp enter_insert_mode_undo_saved
 
 start_replace_char:
     call clear_count
@@ -1331,7 +1368,7 @@ operator_motion_change:
     je operator_done
     call save_undo
     call delete_range
-    mov qword ptr [mode], 1
+    call enter_insert_mode_undo_saved
 operator_done:
     ret
 
@@ -1379,8 +1416,7 @@ change_word_range_done:
     mov [cursor], r12
     call save_undo
     call delete_range
-    mov qword ptr [mode], 1
-    ret
+    jmp enter_insert_mode_undo_saved
 
 compute_operator_range:
     mov r13b, al
@@ -1968,7 +2004,7 @@ insert_newline:
 insert_backspace:
     cmp qword ptr [cursor], 0
     je insert_done
-    call save_undo
+    call save_insert_undo_once
     dec qword ptr [cursor]
     call delete_char
     ret
@@ -1988,7 +2024,7 @@ insert_byte:
     jne insert_byte_done
     mov r14, [buf_ptr]
 insert_byte_have_capacity:
-    call save_undo
+    call save_edit_undo
     mov rax, [buf_len]
     mov rbx, rax
 insert_shift:
@@ -2270,7 +2306,8 @@ copy_command_no_name:
     mov rax, 1
     ret
 
-# Write the whole buffer to the current file using O_TRUNC.
+# Write the whole buffer to the current file using O_TRUNC. write(2) is allowed
+# to complete partially, so keep going until every byte has been written.
 save_file:
     cmp qword ptr [file_name_len], 0
     jne save_have_name
@@ -2289,20 +2326,32 @@ save_have_name:
     test rax, rax
     js save_failed
     mov r12, rax
+    xor r13, r13
+save_write_loop:
+    cmp r13, [buf_len]
+    jae save_write_done
     mov rax, SYS_WRITE
     mov rdi, r12
-    mov rsi, r14
+    lea rsi, [r14 + r13]
     mov rdx, [buf_len]
+    sub rdx, r13
     syscall
-    mov r13, rax
+    cmp rax, 0
+    jle save_write_failed
+    add r13, rax
+    jmp save_write_loop
+save_write_done:
     mov rax, SYS_CLOSE
     mov rdi, r12
     syscall
-    cmp r13, [buf_len]
-    jne save_failed
     mov qword ptr [dirty], 0
     xor rax, rax
     ret
+save_write_failed:
+    mov rax, SYS_CLOSE
+    mov rdi, r12
+    syscall
+    jmp save_failed
 save_failed:
     mov rsi, offset msg_write_error
     mov rdx, msg_write_error_len
@@ -2318,6 +2367,9 @@ redraw:
     call update_window_size
     call ensure_cursor_visible
 
+    mov rsi, offset hide_cursor
+    mov rdx, hide_cursor_len
+    call write_stdout
     mov rsi, offset clear_screen
     mov rdx, clear_screen_len
     call write_stdout
@@ -2391,6 +2443,9 @@ finish_status_no_pos:
     mov rdx, status_end_len
     call write_stdout
     call place_cursor
+    mov rsi, offset show_cursor
+    mov rdx, show_cursor_len
+    call write_stdout
     ret
 
 # Count logical lines for the status display. Empty buffers still report one
