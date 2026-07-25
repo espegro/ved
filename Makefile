@@ -1,7 +1,7 @@
 AS := as
 LD := ld
 
-.PHONY: all clean
+.PHONY: all clean check
 
 all: ved
 
@@ -13,3 +13,6 @@ ved.o: ved.s
 
 clean:
 	rm -f ved ved.o
+
+check: ved
+	sh tests/smoke.sh
