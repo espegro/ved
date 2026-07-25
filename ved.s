@@ -12,6 +12,12 @@
 .equ SYS_EXIT, 60
 .equ SYS_IOCTL, 16
 .equ SYS_MREMAP, 25
+.equ SYS_FSYNC, 74
+.equ SYS_RENAME, 82
+.equ SYS_UNLINK, 87
+
+.equ ERRNO_ENOENT, 2
+.equ ERRNO_EINTR, 4
 
 .equ O_RDONLY, 0
 .equ O_WRONLY, 1
@@ -108,6 +114,14 @@ msg_write_error:
     .ascii "\033[7m Write failed \033[m\r"
 msg_write_error_len = . - msg_write_error
 
+msg_load_error:
+    .ascii "\033[7m Read failed \033[m\r\n"
+msg_load_error_len = . - msg_load_error
+
+msg_terminal_error:
+    .ascii "ved: stdin is not a usable terminal\n"
+msg_terminal_error_len = . - msg_terminal_error
+
 msg_no_name:
     .ascii "\033[7m No file name: use :w <file> \033[m\r"
 msg_no_name_len = . - msg_no_name
@@ -115,6 +129,10 @@ msg_no_name_len = . - msg_no_name
 status_no_name:
     .ascii "[No Name]"
 status_no_name_len = . - status_no_name
+
+temp_suffix:
+    .ascii ".ved.tmp"
+temp_suffix_len = . - temp_suffix
 
 seq_cursor_prefix:
     .ascii "\033["
@@ -182,6 +200,10 @@ yank_type:
 file_name:
     .skip NAME_CAP
 file_name_len:
+    .quad 0
+temp_name:
+    .skip NAME_CAP
+temp_name_len:
     .quad 0
 
 # Buffer state. cursor is a byte offset into buf, not a screen coordinate.
@@ -263,8 +285,23 @@ have_arg:
 start_editor:
     call init_main_buffer
     call load_file
+    test rax, rax
+    jz start_editor_terminal
+    mov rsi, offset msg_load_error
+    mov rdx, msg_load_error_len
+    call write_stdout
+    mov rdi, 1
+    jmp exit_now
 
+start_editor_terminal:
     call enable_raw
+    test rax, rax
+    jz main_loop
+    mov rsi, offset msg_terminal_error
+    mov rdx, msg_terminal_error_len
+    call write_stdout
+    mov rdi, 1
+    jmp exit_now
 
 main_loop:
     cmp qword ptr [running], 0
@@ -353,6 +390,9 @@ ensure_dynamic_have_cap:
     cmp rcx, rbx
     jae ensure_dynamic_target
 ensure_dynamic_grow:
+    mov rax, 0x4000000000000000
+    cmp rcx, rax
+    jae ensure_dynamic_fail
     shl rcx, 1
     cmp rcx, rbx
     jb ensure_dynamic_grow
@@ -426,7 +466,11 @@ load_file:
     xor rdx, rdx
     syscall
     test rax, rax
-    js load_empty
+    jns load_file_opened
+    cmp rax, -ERRNO_ENOENT
+    je load_empty
+    jmp load_open_error
+load_file_opened:
     mov r12, rax
     mov qword ptr [buf_len], 0
     mov qword ptr [cursor], 0
@@ -442,7 +486,7 @@ load_file_read:
     lea rsi, [buf_cap]
     call ensure_dynamic_buffer
     test rax, rax
-    jne close_loaded
+    jne load_file_error
     mov r14, [buf_ptr]
     jmp load_file_read
 load_file_have_space:
@@ -452,8 +496,10 @@ load_file_have_space:
     mov rdx, [buf_cap]
     sub rdx, rbx
     syscall
+    cmp rax, -ERRNO_EINTR
+    je load_file_read
     test rax, rax
-    js close_loaded
+    js load_file_error
     je close_loaded
     add qword ptr [buf_len], rax
     cmp rax, rdx
@@ -462,7 +508,19 @@ close_loaded:
     mov rax, SYS_CLOSE
     mov rdi, r12
     syscall
+    xor rax, rax
+    ret
+load_file_error:
+    mov rax, SYS_CLOSE
+    mov rdi, r12
+    syscall
+    mov rax, 1
+    ret
+load_open_error:
+    mov rax, 1
+    ret
 load_empty:
+    xor rax, rax
     ret
 
 # Put stdin in raw mode so keys arrive one byte at a time. The original
@@ -473,6 +531,8 @@ enable_raw:
     mov rsi, TCGETS
     mov rdx, offset orig_termios
     syscall
+    test rax, rax
+    js enable_raw_fail
 
     xor rcx, rcx
 copy_termios:
@@ -495,6 +555,12 @@ raw_flags:
     mov rsi, TCSETS
     mov rdx, offset raw_termios
     syscall
+    test rax, rax
+    js enable_raw_fail
+    xor rax, rax
+    ret
+enable_raw_fail:
+    mov rax, 1
     ret
 
 # Restore the terminal settings that were active when the editor started.
@@ -1147,6 +1213,7 @@ yank_range_found:
     jbe yank_len_ok
     lea rdi, [yank_ptr]
     lea rsi, [yank_cap]
+    mov rdx, r11
     call ensure_dynamic_buffer
     test rax, rax
     jne yank_no_data
@@ -1478,6 +1545,7 @@ yank_range_len_ok:
     jbe yank_range_have_space
     lea rdi, [yank_ptr]
     lea rsi, [yank_cap]
+    mov rdx, r11
     call ensure_dynamic_buffer
     test rax, rax
     jne yank_no_data
@@ -2306,8 +2374,9 @@ copy_command_no_name:
     mov rax, 1
     ret
 
-# Write the whole buffer to the current file using O_TRUNC. write(2) is allowed
-# to complete partially, so keep going until every byte has been written.
+# Write the whole buffer to a temporary file, fsync it, and atomically replace
+# the current file. write(2) is allowed to complete partially, so keep going
+# until every byte has been written.
 save_file:
     cmp qword ptr [file_name_len], 0
     jne save_have_name
@@ -2318,8 +2387,11 @@ save_file:
     mov rax, 1
     ret
 save_have_name:
+    call copy_temp_filename
+    test rax, rax
+    jne save_failed
     mov rax, SYS_OPEN
-    mov rdi, offset file_name
+    mov rdi, offset temp_name
     mov rsi, O_WRONLY | O_CREAT | O_TRUNC
     mov rdx, 0644
     syscall
@@ -2336,14 +2408,32 @@ save_write_loop:
     mov rdx, [buf_len]
     sub rdx, r13
     syscall
+    cmp rax, -ERRNO_EINTR
+    je save_write_loop
     cmp rax, 0
     jle save_write_failed
     add r13, rax
     jmp save_write_loop
 save_write_done:
+save_fsync:
+    mov rax, SYS_FSYNC
+    mov rdi, r12
+    syscall
+    cmp rax, -ERRNO_EINTR
+    je save_fsync
+    test rax, rax
+    js save_write_failed
     mov rax, SYS_CLOSE
     mov rdi, r12
     syscall
+    test rax, rax
+    js save_unlink_failed
+    mov rax, SYS_RENAME
+    mov rdi, offset temp_name
+    mov rsi, offset file_name
+    syscall
+    test rax, rax
+    js save_unlink_failed
     mov qword ptr [dirty], 0
     xor rax, rax
     ret
@@ -2351,12 +2441,49 @@ save_write_failed:
     mov rax, SYS_CLOSE
     mov rdi, r12
     syscall
+save_unlink_failed:
+    mov rax, SYS_UNLINK
+    mov rdi, offset temp_name
+    syscall
     jmp save_failed
 save_failed:
     mov rsi, offset msg_write_error
     mov rdx, msg_write_error_len
     call write_stdout
     call read_key
+    mov rax, 1
+    ret
+
+# Build a temporary path next to the target file for atomic replacement.
+copy_temp_filename:
+    mov rax, [file_name_len]
+    add rax, temp_suffix_len
+    cmp rax, NAME_CAP - 1
+    ja copy_temp_filename_fail
+    xor rcx, rcx
+copy_temp_name_loop:
+    cmp rcx, [file_name_len]
+    jae copy_temp_suffix
+    mov al, byte ptr [file_name + rcx]
+    mov byte ptr [temp_name + rcx], al
+    inc rcx
+    jmp copy_temp_name_loop
+copy_temp_suffix:
+    xor rbx, rbx
+copy_temp_suffix_loop:
+    cmp rbx, temp_suffix_len
+    jae copy_temp_filename_done
+    mov al, byte ptr [temp_suffix + rbx]
+    mov byte ptr [temp_name + rcx], al
+    inc rcx
+    inc rbx
+    jmp copy_temp_suffix_loop
+copy_temp_filename_done:
+    mov byte ptr [temp_name + rcx], 0
+    mov [temp_name_len], rcx
+    xor rax, rax
+    ret
+copy_temp_filename_fail:
     mov rax, 1
     ret
 
@@ -2458,10 +2585,6 @@ count_lines_loop:
     jae count_lines_done
     cmp byte ptr [r14 + rbx], 10
     jne count_lines_next
-    mov rax, rbx
-    inc rax
-    cmp rax, [buf_len]
-    jae count_lines_next
     inc qword ptr [total_lines]
 count_lines_next:
     inc rbx
@@ -2704,8 +2827,25 @@ dec_loop:
 write_stdout:
     test rdx, rdx
     je write_done
+    push rbx
+    push r12
+    mov rbx, rsi
+    mov r12, rdx
+write_stdout_loop:
     mov rax, SYS_WRITE
     mov rdi, 1
+    mov rsi, rbx
+    mov rdx, r12
     syscall
+    cmp rax, -ERRNO_EINTR
+    je write_stdout_loop
+    test rax, rax
+    jle write_stdout_done
+    add rbx, rax
+    sub r12, rax
+    jnz write_stdout_loop
+write_stdout_done:
+    pop r12
+    pop rbx
 write_done:
     ret

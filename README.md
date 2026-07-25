@@ -10,6 +10,12 @@ library.
 make
 ```
 
+Run the smoke tests with:
+
+```sh
+make check
+```
+
 ## Run
 
 ```sh
