@@ -28,6 +28,17 @@ if command -v script >/dev/null 2>&1; then
         script -qefc "./ved $target" /dev/null >/dev/null 2>&1
     test "$(stat -c '%a' "$target")" = "600"
     test "$(cat "$target")" = "!abc"
+
+    printf 'foo foo\nfoo\n' > "$target"
+    printf ':%%s/foo/bar/g\n:wq\n' |
+        script -qefc "./ved $target" /dev/null >/dev/null 2>&1
+    test "$(sed -n '1p' "$target")" = "bar bar"
+    test "$(sed -n '2p' "$target")" = "bar"
+
+    : > "$target"
+    printf 'qaiX\033q@a:wq\n' |
+        script -qefc "./ved $target" /dev/null >/dev/null 2>&1
+    test "$(cat "$target")" = "XX"
 fi
 
 echo "smoke tests passed"

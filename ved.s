@@ -48,6 +48,7 @@
 .equ NAME_CAP, 256
 .equ CMD_CAP, 128
 .equ SEARCH_CAP, 128
+.equ MACRO_CAP, 256
 
 .section .rodata
 # Terminal escape sequences and short messages.
@@ -133,6 +134,10 @@ msg_terminal_error_len = . - msg_terminal_error
 msg_filename_error:
     .ascii "ved: filename too long\n"
 msg_filename_error_len = . - msg_filename_error
+
+msg_substitute_error:
+    .ascii "\033[7m Usage: :[range]s/old/new/[g] \033[m\r"
+msg_substitute_error_len = . - msg_substitute_error
 
 msg_no_name:
     .ascii "\033[7m No file name: use :w <file> \033[m\r"
@@ -279,6 +284,36 @@ search_buf:
     .skip SEARCH_CAP
 search_len:
     .quad 0
+replace_buf:
+    .skip SEARCH_CAP
+replace_len:
+    .quad 0
+substitute_global:
+    .quad 0
+substitute_all:
+    .quad 0
+substitute_start:
+    .quad 0
+substitute_end:
+    .quad 0
+
+# Macro storage. Each register holds a bounded sequence of raw key bytes.
+macro_data:
+    .skip 26 * MACRO_CAP
+macro_lengths:
+    .skip 26 * 8
+macro_recording:
+    .quad 0
+macro_pending:
+    .quad 0
+macro_replaying:
+    .quad 0
+macro_replay_reg:
+    .quad 0
+macro_replay_pos:
+    .quad 0
+macro_last_reg:
+    .quad 0
 orig_termios:
     .skip 64
 raw_termios:
@@ -355,6 +390,29 @@ main_loop:
     je force_quit
     cmp al, 17                 # Ctrl-Q: emergency quit
     je force_quit
+    # Record dispatched keys, except the single q that terminates recording.
+    # Playback is deliberately not recorded, which prevents recursive growth.
+    cmp qword ptr [macro_recording], 0
+    je dispatch_key
+    cmp qword ptr [macro_replaying], 0
+    jne dispatch_key
+    cmp al, 'q'
+    je dispatch_key
+    mov r15b, al
+    mov rax, [macro_recording]
+    dec rax
+    imul rax, rax, MACRO_CAP
+    mov rcx, [macro_recording]
+    dec rcx
+    imul rcx, 8
+    mov rdx, [macro_lengths + rcx]
+    cmp rdx, MACRO_CAP
+    jae dispatch_key
+    mov byte ptr [macro_data + rax + rdx], r15b
+    inc rdx
+    mov [macro_lengths + rcx], rdx
+    mov al, r15b
+dispatch_key:
     cmp qword ptr [mode], 1
     je dispatch_insert
     cmp qword ptr [mode], 2
@@ -678,6 +736,27 @@ signal_restorer:
 # Read one logical key into keybuf. If escape parsing pushed one byte back,
 # return that byte before doing another read syscall.
 read_key:
+    # Replay is injected before stdin, so macro playback follows exactly the
+    # same dispatch path as keys typed by the user.
+    cmp qword ptr [macro_replaying], 0
+    je read_key_pending
+    mov rax, [macro_replay_reg]
+    imul rax, rax, MACRO_CAP
+    add rax, [macro_replay_pos]
+    mov rcx, [macro_replay_reg]
+    imul rcx, 8
+    mov rdx, [macro_lengths + rcx]
+    cmp qword ptr [macro_replay_pos], rdx
+    jb read_macro_byte
+    mov qword ptr [macro_replaying], 0
+    jmp read_key_pending
+read_macro_byte:
+    movzx eax, byte ptr [macro_data + rax]
+    mov byte ptr [keybuf], al
+    inc qword ptr [macro_replay_pos]
+    mov rax, 1
+    ret
+read_key_pending:
     cmp qword ptr [pending_valid], 0
     je read_key_syscall
     mov al, byte ptr [pending_key]
@@ -706,6 +785,54 @@ check_input_available:
 
 # Normal mode: vi-like movement/editing commands and pending operators.
 handle_normal:
+    # q stops an active recording before it can be interpreted as a command.
+    cmp qword ptr [macro_recording], 0
+    je normal_macro_pending
+    cmp al, 'q'
+    jne normal_macro_pending
+    mov qword ptr [macro_recording], 0
+    ret
+normal_macro_pending:
+    cmp qword ptr [macro_pending], 0
+    je normal_macro_ready
+    mov rbx, [macro_pending]
+    cmp al, '@'
+    je macro_repeat_last
+    cmp al, 'a'
+    jb macro_pending_cancel
+    cmp al, 'z'
+    ja macro_pending_cancel
+    sub al, 'a'
+    movzx rax, al
+    cmp rbx, 1
+    je macro_begin_record
+    mov [macro_replay_reg], rax
+    mov qword ptr [macro_replay_pos], 0
+    mov qword ptr [macro_replaying], 1
+    mov [macro_last_reg], rax
+    mov qword ptr [macro_pending], 0
+    ret
+macro_repeat_last:
+    cmp rbx, 2
+    jne macro_pending_cancel
+    mov rax, [macro_last_reg]
+    mov [macro_replay_reg], rax
+    mov qword ptr [macro_replay_pos], 0
+    mov qword ptr [macro_replaying], 1
+    mov qword ptr [macro_pending], 0
+    ret
+macro_begin_record:
+    inc rax
+    mov [macro_recording], rax
+    dec rax
+    imul rax, 8
+    mov qword ptr [macro_lengths + rax], 0
+    mov qword ptr [macro_pending], 0
+    ret
+macro_pending_cancel:
+    mov qword ptr [macro_pending], 0
+    ret
+normal_macro_ready:
     cmp qword ptr [replace_pending], 0
     jne normal_replace_char
     cmp qword ptr [g_pending], 0
@@ -831,6 +958,10 @@ normal_not_count:
     je goto_line_counted
     cmp al, 'g'
     je normal_g_pending
+    cmp al, 'q'
+    je normal_macro_record
+    cmp al, '@'
+    je normal_macro_play
     cmp al, ':'
     je start_command
     call clear_count
@@ -855,6 +986,16 @@ normal_change_pending:
 
 normal_g_pending:
     mov qword ptr [g_pending], 1
+    ret
+
+normal_macro_record:
+    # The next letter selects the register; the actual q key is not recorded.
+    mov qword ptr [macro_pending], 1
+    ret
+
+normal_macro_play:
+    # @ followed by a register starts playback; @@ repeats the last one.
+    mov qword ptr [macro_pending], 2
     ret
 
 normal_insert:
@@ -2380,6 +2521,10 @@ run_command:
     mov rax, [cmdlen]
     cmp rax, 0
     je command_done_ret
+    cmp byte ptr [cmdbuf], 's'
+    je run_substitute_command
+    cmp byte ptr [cmdbuf], '%'
+    je run_substitute_command
     cmp byte ptr [cmdbuf], 'w'
     je command_maybe_write
     cmp rax, 1
@@ -2409,6 +2554,219 @@ maybe_wq:
     jne command_done_ret
     mov qword ptr [running], 0
 command_done_ret:
+    ret
+
+# Parse and execute a small, literal subset of vi's substitute command:
+#   :s/old/new/       first match on the current line
+#   :s/old/new/g      all matches on the current line
+#   :%s/old/new/g     all matches in the buffer
+# Regexes and flags other than g are intentionally left for a later phase.
+run_substitute_command:
+    mov qword ptr [substitute_global], 0
+    mov qword ptr [substitute_all], 0
+    xor rbx, rbx
+    cmp byte ptr [cmdbuf], '%'
+    jne substitute_prefix_s
+    cmp byte ptr [cmdbuf + 1], 's'
+    jne substitute_syntax_error
+    mov qword ptr [substitute_global], 1
+    mov rbx, 1
+substitute_prefix_s:
+    cmp byte ptr [cmdbuf + rbx], 's'
+    jne substitute_syntax_error
+    inc rbx
+    cmp rbx, [cmdlen]
+    jae substitute_syntax_error
+    mov r15b, byte ptr [cmdbuf + rbx]
+    inc rbx
+    xor rcx, rcx
+substitute_parse_old:
+    cmp rbx, [cmdlen]
+    jae substitute_syntax_error
+    cmp rcx, SEARCH_CAP - 1
+    jae substitute_syntax_error
+    mov al, byte ptr [cmdbuf + rbx]
+    cmp al, r15b
+    je substitute_old_done
+    mov byte ptr [search_buf + rcx], al
+    inc rcx
+    inc rbx
+    jmp substitute_parse_old
+substitute_old_done:
+    mov [search_len], rcx
+    test rcx, rcx
+    je substitute_syntax_error
+    mov byte ptr [search_buf + rcx], 0
+    inc rbx
+    xor rcx, rcx
+substitute_parse_new:
+    cmp rbx, [cmdlen]
+    jae substitute_new_done
+    cmp rcx, SEARCH_CAP - 1
+    jae substitute_syntax_error
+    mov al, byte ptr [cmdbuf + rbx]
+    cmp al, r15b
+    je substitute_new_delimited
+    mov byte ptr [replace_buf + rcx], al
+    inc rcx
+    inc rbx
+    jmp substitute_parse_new
+substitute_new_delimited:
+    inc rbx
+substitute_new_done:
+    mov [replace_len], rcx
+    mov byte ptr [replace_buf + rcx], 0
+    cmp rbx, [cmdlen]
+    jae substitute_execute
+    cmp byte ptr [cmdbuf + rbx], 'g'
+    jne substitute_syntax_error
+    mov qword ptr [substitute_all], 1
+    inc rbx
+    cmp rbx, [cmdlen]
+    jne substitute_syntax_error
+substitute_execute:
+    call substitute_set_range
+    call save_undo
+    mov r8, [substitute_start]
+    mov r9, [substitute_end]
+    call substitute_matches
+    mov qword ptr [mode], 0
+    ret
+substitute_syntax_error:
+    mov rsi, offset msg_substitute_error
+    mov rdx, msg_substitute_error_len
+    call write_stdout
+    call read_key
+    ret
+
+# Return the replacement range as [r8, r9). The whole buffer is used for %s;
+# otherwise the range is the current logical line without its newline.
+substitute_set_range:
+    cmp qword ptr [substitute_global], 0
+    je substitute_current_line
+    xor r8, r8
+    mov r9, [buf_len]
+    mov [substitute_start], r8
+    mov [substitute_end], r9
+    ret
+substitute_current_line:
+    mov r8, [cursor]
+substitute_line_start:
+    test r8, r8
+    je substitute_line_end
+    cmp byte ptr [r14 + r8 - 1], 10
+    je substitute_line_end
+    dec r8
+    jmp substitute_line_start
+substitute_line_end:
+    mov r9, [cursor]
+substitute_line_end_loop:
+    cmp r9, [buf_len]
+    jae substitute_range_done
+    cmp byte ptr [r14 + r9], 10
+    je substitute_range_done
+    inc r9
+    jmp substitute_line_end_loop
+substitute_range_done:
+    mov [substitute_start], r8
+    mov [substitute_end], r9
+    ret
+
+# Replace literal matches in the range. The tail is shifted in-place, and the
+# range end is adjusted after every replacement so global replacement remains
+# correct when old and new strings have different lengths.
+substitute_matches:
+    mov r10, [search_len]
+    mov r11, [replace_len]
+    mov rbx, r8
+substitute_find:
+    mov rax, rbx
+    add rax, r10
+    cmp rax, r9
+    ja substitute_done
+    xor rcx, rcx
+substitute_compare:
+    cmp rcx, r10
+    jae substitute_match
+    mov rax, rbx
+    add rax, rcx
+    mov al, byte ptr [r14 + rax]
+    cmp al, byte ptr [search_buf + rcx]
+    jne substitute_next
+    inc rcx
+    jmp substitute_compare
+substitute_match:
+    call substitute_replace_at
+    cmp qword ptr [substitute_all], 0
+    je substitute_done
+    jmp substitute_find
+substitute_next:
+    inc rbx
+    jmp substitute_find
+substitute_done:
+    ret
+
+# Replace search_len bytes at rbx with replace_len bytes.
+substitute_replace_at:
+    mov r10, [search_len]
+    mov r11, [replace_len]
+    mov r12, r11
+    sub r12, r10
+    cmp r12, 0
+    jle substitute_shrink_or_equal
+    mov rax, [buf_len]
+    add rax, r12
+    lea rdi, [buf_ptr]
+    lea rsi, [buf_cap]
+    mov rdx, rax
+    call ensure_dynamic_buffer
+    test rax, rax
+    jne substitute_done
+    mov r14, [buf_ptr]
+    mov rax, [buf_len]
+    mov rcx, rbx
+    add rcx, r10
+    mov rdx, rax
+    add rdx, r12
+substitute_grow_tail:
+    cmp rax, rcx
+    jbe substitute_copy_new
+    dec rax
+    dec rdx
+    mov r8b, byte ptr [r14 + rax]
+    mov byte ptr [r14 + rdx], r8b
+    jmp substitute_grow_tail
+substitute_shrink_or_equal:
+    je substitute_copy_new
+    mov rax, rbx
+    add rax, r10
+    mov rcx, rax
+    mov rdx, rbx
+substitute_shrink_tail:
+    cmp rcx, [buf_len]
+    jae substitute_shrink_done
+    mov r8b, byte ptr [r14 + rcx]
+    mov byte ptr [r14 + rdx], r8b
+    inc rcx
+    inc rdx
+    jmp substitute_shrink_tail
+substitute_shrink_done:
+substitute_copy_new:
+    xor rcx, rcx
+substitute_copy_new_loop:
+    cmp rcx, r11
+    jae substitute_update_lengths
+    mov r8b, byte ptr [replace_buf + rcx]
+    mov rax, rbx
+    add rax, rcx
+    mov byte ptr [r14 + rax], r8b
+    inc rcx
+    jmp substitute_copy_new_loop
+substitute_update_lengths:
+    add qword ptr [buf_len], r12
+    add r9, r12
+    add rbx, r11
+    mov qword ptr [dirty], 1
     ret
 maybe_qbang:
     cmp byte ptr [cmdbuf], 'q'

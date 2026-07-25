@@ -43,6 +43,10 @@ Use `:w file.txt` to name and save an unnamed buffer.
   `cw`, `c$`, and `cc`. `cw` changes the current word and enters insert mode.
 - One-level undo with `u`.
 - Search with `/pattern`, `n`, and `N`.
+- Literal substitution with `:s/old/new/`, `:s/old/new/g`, and
+  `:%s/old/new/g`.
+- Keyboard macros with `qa`, `q`, `@a`, and `@@`, using bounded `a`-`z`
+  registers.
 
 ## Current Limitations
 
