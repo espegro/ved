@@ -12,6 +12,11 @@
 .equ SYS_EXIT, 60
 .equ SYS_IOCTL, 16
 .equ SYS_MREMAP, 25
+.equ SYS_RT_SIGACTION, 13
+.equ SYS_RT_SIGRETURN, 15
+.equ SYS_GETPID, 39
+.equ SYS_FSTAT, 5
+.equ SYS_FCHMOD, 91
 .equ SYS_FSYNC, 74
 .equ SYS_RENAME, 82
 .equ SYS_UNLINK, 87
@@ -23,6 +28,9 @@
 .equ O_WRONLY, 1
 .equ O_CREAT, 64
 .equ O_TRUNC, 512
+.equ O_EXCL, 128
+
+.equ SA_RESTORER, 0x04000000
 
 .equ PROT_READ, 1
 .equ PROT_WRITE, 2
@@ -122,6 +130,10 @@ msg_terminal_error:
     .ascii "ved: stdin is not a usable terminal\n"
 msg_terminal_error_len = . - msg_terminal_error
 
+msg_filename_error:
+    .ascii "ved: filename too long\n"
+msg_filename_error_len = . - msg_filename_error
+
 msg_no_name:
     .ascii "\033[7m No file name: use :w <file> \033[m\r"
 msg_no_name_len = . - msg_no_name
@@ -131,8 +143,11 @@ status_no_name:
 status_no_name_len = . - status_no_name
 
 temp_suffix:
-    .ascii ".ved.tmp"
+    .ascii ".ved.tmp."
 temp_suffix_len = . - temp_suffix
+
+hex_digits:
+    .ascii "0123456789abcdef"
 
 seq_cursor_prefix:
     .ascii "\033["
@@ -164,6 +179,10 @@ cursor_col:
     .quad 0
 total_lines:
     .quad 1
+raw_enabled:
+    .quad 0
+io_error:
+    .quad 0
 
 # Dynamic buffer pointers/capacities. The main text buffer is mirrored in r14.
 buf_ptr:
@@ -201,10 +220,16 @@ file_name:
     .skip NAME_CAP
 file_name_len:
     .quad 0
+file_name_error:
+    .quad 0
 temp_name:
     .skip NAME_CAP
 temp_name_len:
     .quad 0
+temp_mode:
+    .quad 0
+stat_buf:
+    .skip 144
 
 # Buffer state. cursor is a byte offset into buf, not a screen coordinate.
 buf_len:
@@ -258,6 +283,8 @@ orig_termios:
     .skip 64
 raw_termios:
     .skip 64
+signal_action:
+    .skip 152
 
 # struct winsize storage: rows, cols, x pixels, y pixels.
 winsize:
@@ -281,6 +308,9 @@ _start:
 have_arg:
     mov rsi, [rsp + 16]         # argv[1]
     call copy_file_name
+    cmp qword ptr [file_name_error], 0
+    je start_editor
+    jmp filename_error_exit
 
 start_editor:
     call init_main_buffer
@@ -303,10 +333,19 @@ start_editor_terminal:
     mov rdi, 1
     jmp exit_now
 
+filename_error_exit:
+    mov rsi, offset msg_filename_error
+    mov rdx, msg_filename_error_len
+    call write_stdout
+    mov rdi, 1
+    jmp exit_now
+
 main_loop:
     cmp qword ptr [running], 0
     je done
     call redraw
+    cmp qword ptr [io_error], 0
+    jne force_quit
     call read_key
     cmp rax, 0
     jl main_loop
@@ -351,7 +390,12 @@ copy_file_name:
     xor rcx, rcx
 copy_name_loop:
     cmp rcx, NAME_CAP - 1
-    jae copy_name_done
+    jb copy_name_byte
+    cmp byte ptr [rsi + rcx], 0
+    je copy_name_done
+    mov qword ptr [file_name_error], 1
+    jmp copy_name_done
+copy_name_byte:
     mov al, byte ptr [rsi + rcx]
     mov byte ptr [file_name + rcx], al
     test al, al
@@ -550,6 +594,10 @@ raw_flags:
     mov byte ptr [raw_termios + 17 + 6], 1       # VMIN
     mov byte ptr [raw_termios + 17 + 5], 0       # VTIME
 
+    call install_signals
+    test rax, rax
+    js enable_raw_fail
+
     mov rax, SYS_IOCTL
     mov rdi, 0
     mov rsi, TCSETS
@@ -557,6 +605,7 @@ raw_flags:
     syscall
     test rax, rax
     js enable_raw_fail
+    mov qword ptr [raw_enabled], 1
     xor rax, rax
     ret
 enable_raw_fail:
@@ -573,10 +622,58 @@ disable_raw:
     mov rsi, TCSETS
     mov rdx, offset orig_termios
     syscall
+    mov qword ptr [raw_enabled], 0
     mov rsi, offset clear_screen
     mov rdx, clear_screen_len
     call write_stdout
     ret
+
+# Install a minimal restorable handler for signals that commonly terminate the
+# editor. The kernel sigaction layout is handler, flags, restorer, mask[16].
+install_signals:
+    mov qword ptr [signal_action + 0], offset signal_handler
+    mov qword ptr [signal_action + 8], SA_RESTORER
+    mov qword ptr [signal_action + 16], offset signal_restorer
+    lea rdi, [signal_action + 24]
+    xor eax, eax
+    mov ecx, 16
+    rep stosq
+    mov r10, 8
+    mov rax, SYS_RT_SIGACTION
+    mov rdi, 1                  # SIGHUP
+    mov rsi, offset signal_action
+    xor rdx, rdx
+    syscall
+    test rax, rax
+    js install_signals_fail
+    mov rax, SYS_RT_SIGACTION
+    mov rdi, 2                  # SIGINT
+    syscall
+    test rax, rax
+    js install_signals_fail
+    mov rax, SYS_RT_SIGACTION
+    mov rdi, 15                 # SIGTERM
+    syscall
+    test rax, rax
+    js install_signals_fail
+    xor rax, rax
+    ret
+install_signals_fail:
+    mov rax, -1
+    ret
+
+signal_handler:
+    cmp qword ptr [raw_enabled], 0
+    je signal_exit
+    mov qword ptr [raw_enabled], 0
+    call disable_raw
+signal_exit:
+    mov rax, SYS_EXIT
+    xor rdi, rdi
+    syscall
+signal_restorer:
+    mov rax, SYS_RT_SIGRETURN
+    syscall
 
 # Read one logical key into keybuf. If escape parsing pushed one byte back,
 # return that byte before doing another read syscall.
@@ -2326,7 +2423,15 @@ command_write:
 command_write_named:
     call copy_command_filename
     cmp rax, 0
+    je command_write_named_save
+    cmp rax, 2
     jne command_done_ret
+    mov rsi, offset msg_filename_error
+    mov rdx, msg_filename_error_len
+    call write_stdout
+    call read_key
+    ret
+command_write_named_save:
     call save_file
     ret
 command_quit:
@@ -2357,7 +2462,10 @@ copy_command_name_loop:
     cmp rbx, [cmdlen]
     jae copy_command_name_done
     cmp rcx, NAME_CAP - 1
-    jae copy_command_name_done
+    jb copy_command_name_byte
+    mov rax, 2
+    ret
+copy_command_name_byte:
     mov al, byte ptr [cmdbuf + rbx]
     mov byte ptr [file_name + rcx], al
     inc rbx
@@ -2390,14 +2498,33 @@ save_have_name:
     call copy_temp_filename
     test rax, rax
     jne save_failed
+    mov rax, SYS_STAT
+    mov rdi, offset file_name
+    mov rsi, offset stat_buf
+    syscall
+    test rax, rax
+    js save_default_mode
+    movzx eax, word ptr [stat_buf + 24]
+    and eax, 07777
+    mov [temp_mode], rax
+    jmp save_open_temp
+save_default_mode:
+    mov qword ptr [temp_mode], 0644
+save_open_temp:
     mov rax, SYS_OPEN
     mov rdi, offset temp_name
-    mov rsi, O_WRONLY | O_CREAT | O_TRUNC
-    mov rdx, 0644
+    mov rsi, O_WRONLY | O_CREAT | O_TRUNC | O_EXCL
+    mov rdx, [temp_mode]
     syscall
     test rax, rax
     js save_failed
     mov r12, rax
+    mov rax, SYS_FCHMOD
+    mov rdi, r12
+    mov rsi, [temp_mode]
+    syscall
+    test rax, rax
+    js save_write_failed
     xor r13, r13
 save_write_loop:
     cmp r13, [buf_len]
@@ -2457,7 +2584,7 @@ save_failed:
 # Build a temporary path next to the target file for atomic replacement.
 copy_temp_filename:
     mov rax, [file_name_len]
-    add rax, temp_suffix_len
+    add rax, temp_suffix_len + 8
     cmp rax, NAME_CAP - 1
     ja copy_temp_filename_fail
     xor rcx, rcx
@@ -2472,12 +2599,29 @@ copy_temp_suffix:
     xor rbx, rbx
 copy_temp_suffix_loop:
     cmp rbx, temp_suffix_len
-    jae copy_temp_filename_done
+    jae copy_temp_pid
     mov al, byte ptr [temp_suffix + rbx]
     mov byte ptr [temp_name + rcx], al
     inc rcx
     inc rbx
     jmp copy_temp_suffix_loop
+copy_temp_pid:
+    push rcx
+    mov rax, SYS_GETPID
+    syscall
+    pop rcx
+    mov rbx, 8
+    lea rdi, [temp_name + rcx + 8]
+copy_temp_pid_loop:
+    mov rdx, rax
+    and edx, 15
+    mov dl, byte ptr [hex_digits + rdx]
+    dec rdi
+    mov byte ptr [rdi], dl
+    shr rax, 4
+    dec rbx
+    jnz copy_temp_pid_loop
+    add rcx, 8
 copy_temp_filename_done:
     mov byte ptr [temp_name + rcx], 0
     mov [temp_name_len], rcx
@@ -2845,6 +2989,10 @@ write_stdout_loop:
     sub r12, rax
     jnz write_stdout_loop
 write_stdout_done:
+    test rax, rax
+    jge write_stdout_ok
+    mov qword ptr [io_error], 1
+write_stdout_ok:
     pop r12
     pop rbx
 write_done:
