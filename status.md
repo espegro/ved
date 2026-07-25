@@ -43,6 +43,10 @@ Use `:w file.txt` to name and save an unnamed buffer.
   `cw`, `c$`, and `cc`. `cw` changes the current word and enters insert mode.
 - One-level undo with `u`.
 - Search with `/pattern`, `n`, and `N`.
+- Literal substitution with `:s/old/new/`, `:s/old/new/g`, and
+  `:%s/old/new/g`.
+- Keyboard macros with `qa`, `q`, `@a`, and `@@`, using bounded `a`-`z`
+  registers.
 
 ## Current Limitations
 
@@ -52,10 +56,9 @@ Use `:w file.txt` to name and save an unnamed buffer.
 - Rendering does not handle horizontal scrolling or line wrapping.
 - Tabs and control characters are not rendered specially.
 - There is no multi-level undo, redo, visual mode, or ex-style substitution.
-- File names are limited to 255 bytes and the temporary save path uses a fixed
-  `.ved.tmp` suffix.
-- Signal/crash recovery is minimal; abnormal exits may still require
-  `stty sane`.
+- File names are limited to 255 bytes.
+- Unexpected crashes can still require `stty sane`; common termination signals
+  now restore the terminal before exiting.
 
 ## Useful Next Steps
 

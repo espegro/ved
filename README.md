@@ -68,6 +68,10 @@ You can also start with an unnamed empty buffer:
 - `/pattern` searches forward.
 - `n` repeats the last search forward.
 - `N` repeats the last search backward.
+- `:s/old/new/` replaces the first literal match on the current line.
+- `:s/old/new/g` replaces all literal matches on the current line.
+- `:%s/old/new/g` replaces all literal matches in the buffer.
+- `qa`, `q`, `@a`, and `@@` record, stop, replay, and repeat keyboard macros.
 - `:w` writes the file.
 - `:w file.txt` writes to a filename and makes it the current file.
 - `:q` quits if there are no unsaved changes.
