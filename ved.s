@@ -7,6 +7,8 @@
 .equ SYS_OPEN, 2
 .equ SYS_CLOSE, 3
 .equ SYS_STAT, 4
+.equ SYS_LSTAT, 6
+.equ SYS_POLL, 7
 .equ SYS_MMAP, 9
 .equ SYS_MUNMAP, 11
 .equ SYS_EXIT, 60
@@ -17,9 +19,11 @@
 .equ SYS_GETPID, 39
 .equ SYS_FSTAT, 5
 .equ SYS_FCHMOD, 91
+.equ SYS_FCHOWN, 93
 .equ SYS_FSYNC, 74
 .equ SYS_RENAME, 82
 .equ SYS_UNLINK, 87
+.equ SYS_LLISTXATTR, 195
 
 .equ ERRNO_ENOENT, 2
 .equ ERRNO_EINTR, 4
@@ -29,6 +33,10 @@
 .equ O_CREAT, 64
 .equ O_TRUNC, 512
 .equ O_EXCL, 128
+.equ O_DIRECTORY, 65536
+
+.equ POLLIN, 1
+.equ COUNT_MAX, 1000000000
 
 .equ SA_RESTORER, 0x04000000
 
@@ -40,7 +48,6 @@
 
 .equ TCGETS, 0x5401
 .equ TCSETS, 0x5402
-.equ FIONREAD, 0x541B
 .equ TIOCGWINSZ, 0x5413
 
 # Initial allocations for the dynamic flat buffers.
@@ -143,6 +150,10 @@ msg_no_name:
     .ascii "\033[7m No file name: use :w <file> \033[m\r"
 msg_no_name_len = . - msg_no_name
 
+msg_memory_error:
+    .ascii "\033[7m Out of memory; change was rolled back \033[m\r"
+msg_memory_error_len = . - msg_memory_error
+
 status_no_name:
     .ascii "[No Name]"
 status_no_name_len = . - status_no_name
@@ -181,6 +192,8 @@ top_line:
 cursor_line:
     .quad 0
 cursor_col:
+    .quad 0
+cursor_screen_col:
     .quad 0
 total_lines:
     .quad 1
@@ -233,6 +246,8 @@ temp_name_len:
     .quad 0
 temp_mode:
     .quad 0
+save_existing:
+    .quad 0
 stat_buf:
     .skip 144
 
@@ -246,6 +261,8 @@ cursor:
 mode:
     .quad 0
 insert_undo_saved:
+    .quad 0
+insert_last_was_insert:
     .quad 0
 
 # Dirty means the buffer has unsaved changes.
@@ -268,8 +285,6 @@ count_active:
 
 # Input state. pending_key lets Escape peek for arrow-key sequences without
 # losing the next normal command, such as Esc followed by :wq.
-bytes_avail:
-    .quad 0
 pending_valid:
     .quad 0
 keybuf:
@@ -324,6 +339,18 @@ signal_action:
 # struct winsize storage: rows, cols, x pixels, y pixels.
 winsize:
     .skip 8
+
+# pollfd for briefly waiting on the remainder of an escape sequence.
+escape_pollfd:
+    .skip 8
+
+# Scratch bytes used to render control characters as hexadecimal escapes.
+control_buf:
+    .skip 4
+
+# Parent directory used for fsync after an atomic rename.
+dir_name:
+    .skip NAME_CAP
 
 # Scratch space used when formatting cursor row/column numbers.
 num_buf:
@@ -772,17 +799,6 @@ read_key_syscall:
     syscall
     ret
 
-# Ask the tty how many input bytes are queued. This distinguishes a lone Esc
-# from an arrow-key sequence like ESC [ A.
-check_input_available:
-    mov qword ptr [bytes_avail], 0
-    mov rax, SYS_IOCTL
-    mov rdi, 0
-    mov rsi, FIONREAD
-    mov rdx, offset bytes_avail
-    syscall
-    ret
-
 # Normal mode: vi-like movement/editing commands and pending operators.
 handle_normal:
     # q stops an active recording before it can be interpreted as a command.
@@ -884,8 +900,15 @@ normal_add_count:
     sub al, '0'
     movzx rbx, al
     mov rax, [count_accum]
+    cmp rax, COUNT_MAX
+    jae normal_count_saturated
     imul rax, rax, 10
     add rax, rbx
+    cmp rax, COUNT_MAX
+    jbe normal_count_store
+normal_count_saturated:
+    mov rax, COUNT_MAX
+normal_count_store:
     mov [count_accum], rax
     mov qword ptr [count_active], 1
     ret
@@ -931,7 +954,7 @@ normal_not_count:
     cmp al, 'S'
     je change_line_counted
     cmp al, 'D'
-    je delete_to_line_end
+    je delete_to_line_end_normal
     cmp al, 'C'
     je change_to_line_end
     cmp al, 'r'
@@ -995,7 +1018,10 @@ normal_macro_record:
 
 normal_macro_play:
     # @ followed by a register starts playback; @@ repeats the last one.
+    cmp qword ptr [macro_replaying], 0
+    jne normal_macro_play_done
     mov qword ptr [macro_pending], 2
+normal_macro_play_done:
     ret
 
 normal_insert:
@@ -1114,11 +1140,13 @@ clear_count:
 
 enter_insert_mode:
     mov qword ptr [insert_undo_saved], 0
+    mov qword ptr [insert_last_was_insert], 0
     mov qword ptr [mode], 1
     ret
 
 enter_insert_mode_undo_saved:
     mov qword ptr [insert_undo_saved], 1
+    mov qword ptr [insert_last_was_insert], 0
     mov qword ptr [mode], 1
     ret
 
@@ -1127,6 +1155,12 @@ get_count_or_one:
     je count_default_one
     mov rax, [count_accum]
     call clear_count
+    mov rdx, [buf_len]
+    inc rdx
+    cmp rax, rdx
+    jbe get_count_done
+    mov rax, rdx
+get_count_done:
     ret
 count_default_one:
     mov rax, 1
@@ -1316,24 +1350,35 @@ delete_char_count_loop:
     dec r15
     jmp delete_char_count_loop
 delete_char_count_done:
+    call normalize_normal_cursor
     ret
 
 delete_line_counted:
+    call delete_line_counted_core
+    call normalize_normal_cursor
+    ret
+
+delete_line_counted_core:
     call get_count_or_one
     mov r15, rax
+    mov rax, [cursor]
+    cmp rax, [buf_len]
+    jne delete_line_counted_have_line
+    test rax, rax
+    je delete_line_counted_done
+    cmp byte ptr [r14 + rax - 1], 10
+    je delete_line_counted_done
+delete_line_counted_have_line:
     call yank_lines_from_r15
+    cmp qword ptr [yank_valid], 0
+    je delete_line_counted_done
     call save_undo
-delete_line_count_loop:
-    test r15, r15
-    je delete_line_count_done
-    call delete_line
-    dec r15
-    jmp delete_line_count_loop
-delete_line_count_done:
+    call delete_range
+delete_line_counted_done:
     ret
 
 change_line_counted:
-    call delete_line_counted
+    call delete_line_counted_core
     mov r8, [cursor]
     mov rbx, [buf_len]
 change_line_make_blank_shift:
@@ -1349,6 +1394,30 @@ change_line_make_blank_store:
     mov [cursor], r8
     mov qword ptr [dirty], 1
     jmp enter_insert_mode_undo_saved
+
+# Bring an EOF cursor back onto the last real or empty line in normal mode.
+normalize_normal_cursor:
+    mov rax, [cursor]
+    cmp rax, [buf_len]
+    jb normalize_cursor_done
+    mov rax, [buf_len]
+    test rax, rax
+    je normalize_cursor_empty
+    dec rax
+    cmp byte ptr [r14 + rax], 10
+    jne normalize_cursor_store
+    test rax, rax
+    je normalize_cursor_store
+    cmp byte ptr [r14 + rax - 1], 10
+    je normalize_cursor_store
+    dec rax
+normalize_cursor_store:
+    mov [cursor], rax
+    ret
+normalize_cursor_empty:
+    mov qword ptr [cursor], 0
+normalize_cursor_done:
+    ret
 
 delete_to_line_end:
     call clear_count
@@ -1367,6 +1436,11 @@ delete_to_line_end:
     pop r8
     call delete_range
     mov rax, 1
+    ret
+
+delete_to_line_end_normal:
+    call delete_to_line_end
+    call normalize_normal_cursor
     ret
 delete_to_line_end_done:
     xor rax, rax
@@ -1868,6 +1942,9 @@ goto_top_first:
 move_left:
     cmp qword ptr [cursor], 0
     je move_left_done
+    mov rax, [cursor]
+    cmp byte ptr [r14 + rax - 1], 10
+    je move_left_done
     dec qword ptr [cursor]
 move_left_done:
     ret
@@ -1876,8 +1953,33 @@ move_right:
     mov rax, [cursor]
     cmp rax, [buf_len]
     jae move_right_done
+    cmp byte ptr [r14 + rax], 10
+    je move_right_done
+    inc rax
+    cmp rax, [buf_len]
+    jae move_right_done
+    cmp byte ptr [r14 + rax], 10
+    je move_right_done
     inc qword ptr [cursor]
 move_right_done:
+    ret
+
+# Insert mode uses a gap cursor and may cross line boundaries.
+move_insert_left:
+    cmp qword ptr [cursor], 0
+    je move_insert_left_done
+    dec qword ptr [cursor]
+move_insert_left_done:
+    mov qword ptr [insert_last_was_insert], 0
+    ret
+
+move_insert_right:
+    mov rax, [cursor]
+    cmp rax, [buf_len]
+    jae move_insert_right_done
+    inc qword ptr [cursor]
+move_insert_right_done:
+    mov qword ptr [insert_last_was_insert], 0
     ret
 
 # Move to the start of the next word. Words are byte runs separated by space,
@@ -2244,6 +2346,25 @@ insert_escape:
     jmp leave_insert
 
 leave_insert:
+    cmp qword ptr [insert_last_was_insert], 0
+    je leave_insert_at_eof
+    mov rax, [cursor]
+    test rax, rax
+    je leave_insert_at_eof
+    cmp byte ptr [r14 + rax - 1], 10
+    je leave_insert_at_eof
+    dec qword ptr [cursor]
+    jmp leave_insert_set_mode
+leave_insert_at_eof:
+    mov rax, [cursor]
+    cmp rax, [buf_len]
+    jne leave_insert_set_mode
+    test rax, rax
+    je leave_insert_set_mode
+    cmp byte ptr [r14 + rax - 1], 10
+    je leave_insert_set_mode
+    dec qword ptr [cursor]
+leave_insert_set_mode:
     mov qword ptr [mode], 0
     ret
 
@@ -2251,13 +2372,14 @@ leave_insert:
 # arrow was consumed and handled; otherwise returns rax=0. Non-arrow bytes are
 # pushed back so the main loop can handle them as normal commands.
 read_escape_arrow:
-    call check_input_available
-    cmp qword ptr [bytes_avail], 2
-    jb escape_not_arrow
+    call wait_escape_byte
+    test rax, rax
+    jz escape_not_arrow
     call read_key
     cmp rax, 1
     jne escape_not_arrow
     movzx eax, byte ptr [keybuf]
+    mov r13b, al
     cmp al, '['
     je escape_read_final
     cmp al, 'O'
@@ -2266,10 +2388,14 @@ read_escape_arrow:
     mov qword ptr [pending_valid], 1
     jmp escape_not_arrow
 escape_read_final:
+    call wait_escape_byte
+    test rax, rax
+    jz escape_not_arrow
     call read_key
     cmp rax, 1
     jne escape_not_arrow
     movzx eax, byte ptr [keybuf]
+    mov r12b, al
     cmp al, 'A'
     je escape_up
     cmp al, 'B'
@@ -2282,23 +2408,98 @@ escape_read_final:
     mov qword ptr [pending_valid], 1
     jmp escape_not_arrow
 escape_up:
+    call record_escape_sequence
     call move_up_counted
+    mov qword ptr [insert_last_was_insert], 0
     mov rax, 1
     ret
 escape_down:
+    call record_escape_sequence
     call move_down_counted
+    mov qword ptr [insert_last_was_insert], 0
     mov rax, 1
     ret
 escape_right:
+    call record_escape_sequence
+    cmp qword ptr [mode], 1
+    je escape_insert_right
     call move_right_counted
     mov rax, 1
     ret
+escape_insert_right:
+    call move_insert_right
+    mov rax, 1
+    ret
 escape_left:
+    call record_escape_sequence
+    cmp qword ptr [mode], 1
+    je escape_insert_left
     call move_left_counted
+    mov rax, 1
+    ret
+escape_insert_left:
+    call move_insert_left
     mov rax, 1
     ret
 escape_not_arrow:
     xor rax, rax
+    ret
+
+# Wait briefly for bytes following ESC. Macro and pushed-back input are already
+# available; tty input gets a 50 ms window so SSH latency does not split arrows.
+wait_escape_byte:
+    cmp qword ptr [macro_replaying], 0
+    jne wait_escape_ready
+    cmp qword ptr [pending_valid], 0
+    jne wait_escape_ready
+    mov dword ptr [escape_pollfd], 0
+    mov word ptr [escape_pollfd + 4], POLLIN
+    mov word ptr [escape_pollfd + 6], 0
+wait_escape_poll:
+    mov rax, SYS_POLL
+    mov rdi, offset escape_pollfd
+    mov rsi, 1
+    mov rdx, 50
+    syscall
+    cmp rax, -ERRNO_EINTR
+    je wait_escape_poll
+    test rax, rax
+    jle wait_escape_missing
+wait_escape_ready:
+    mov rax, 1
+    ret
+wait_escape_missing:
+    xor rax, rax
+    ret
+
+# Arrow bytes are consumed inside the parser rather than the main dispatch
+# loop, so explicitly include them in a recording.
+record_escape_sequence:
+    cmp qword ptr [macro_recording], 0
+    je record_escape_done
+    cmp qword ptr [macro_replaying], 0
+    jne record_escape_done
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    mov rax, [macro_recording]
+    dec rax
+    imul rbx, rax, MACRO_CAP
+    imul rcx, rax, 8
+    mov rdx, [macro_lengths + rcx]
+    cmp rdx, MACRO_CAP - 2
+    ja record_escape_restore
+    mov byte ptr [macro_data + rbx + rdx], r13b
+    mov byte ptr [macro_data + rbx + rdx + 1], r12b
+    add rdx, 2
+    mov [macro_lengths + rcx], rdx
+record_escape_restore:
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+record_escape_done:
     ret
 
 # Store LF in the file buffer. Screen rendering later expands it to CRLF.
@@ -2313,6 +2514,7 @@ insert_backspace:
     call save_insert_undo_once
     dec qword ptr [cursor]
     call delete_char
+    mov qword ptr [insert_last_was_insert], 0
     ret
 
 # Insert one byte at cursor by shifting the buffer tail right.
@@ -2346,6 +2548,7 @@ insert_store:
     inc qword ptr [buf_len]
     inc qword ptr [cursor]
     mov qword ptr [dirty], 1
+    mov qword ptr [insert_last_was_insert], 1
 insert_byte_done:
     ret
 
@@ -2627,9 +2830,20 @@ substitute_new_done:
 substitute_execute:
     call substitute_set_range
     call save_undo
+    cmp qword ptr [undo_valid], 0
+    je substitute_memory_error
     mov r8, [substitute_start]
     mov r9, [substitute_end]
     call substitute_matches
+    test rax, rax
+    jz substitute_execute_done
+    call undo_last_change
+substitute_memory_error:
+    mov rsi, offset msg_memory_error
+    mov rdx, msg_memory_error_len
+    call write_stdout
+    call read_key
+substitute_execute_done:
     mov qword ptr [mode], 0
     ret
 substitute_syntax_error:
@@ -2697,6 +2911,8 @@ substitute_compare:
     jmp substitute_compare
 substitute_match:
     call substitute_replace_at
+    test rax, rax
+    jne substitute_failed
     cmp qword ptr [substitute_all], 0
     je substitute_done
     jmp substitute_find
@@ -2704,6 +2920,10 @@ substitute_next:
     inc rbx
     jmp substitute_find
 substitute_done:
+    xor rax, rax
+    ret
+substitute_failed:
+    mov rax, 1
     ret
 
 # Replace search_len bytes at rbx with replace_len bytes.
@@ -2721,7 +2941,7 @@ substitute_replace_at:
     mov rdx, rax
     call ensure_dynamic_buffer
     test rax, rax
-    jne substitute_done
+    jne substitute_replace_failed
     mov r14, [buf_ptr]
     mov rax, [buf_len]
     mov rcx, rbx
@@ -2767,6 +2987,10 @@ substitute_update_lengths:
     add r9, r12
     add rbx, r11
     mov qword ptr [dirty], 1
+    xor rax, rax
+    ret
+substitute_replace_failed:
+    mov rax, 1
     ret
 maybe_qbang:
     cmp byte ptr [cmdbuf], 'q'
@@ -2840,9 +3064,9 @@ copy_command_no_name:
     mov rax, 1
     ret
 
-# Write the whole buffer to a temporary file, fsync it, and atomically replace
-# the current file. write(2) is allowed to complete partially, so keep going
-# until every byte has been written.
+# Save ordinary files through a durable temporary sibling. Link- or
+# metadata-sensitive files use the in-place path below. write(2) may complete
+# partially, so both paths continue until every byte has been written.
 save_file:
     cmp qword ptr [file_name_len], 0
     jne save_have_name
@@ -2853,21 +3077,37 @@ save_file:
     mov rax, 1
     ret
 save_have_name:
-    call copy_temp_filename
-    test rax, rax
-    jne save_failed
-    mov rax, SYS_STAT
+    mov qword ptr [save_existing], 0
+    mov rax, SYS_LSTAT
     mov rdi, offset file_name
     mov rsi, offset stat_buf
     syscall
     test rax, rax
-    js save_default_mode
+    js save_new_file
+    mov qword ptr [save_existing], 1
+    mov eax, dword ptr [stat_buf + 24]
+    and eax, 0170000
+    cmp eax, 0120000             # preserve symlink target/inode in place
+    je save_file_in_place
+    cmp qword ptr [stat_buf + 16], 1
+    ja save_file_in_place        # preserve all hard links to the inode
+    mov rax, SYS_LLISTXATTR
+    mov rdi, offset file_name
+    xor rsi, rsi
+    xor rdx, rdx
+    syscall
+    test rax, rax
+    jg save_file_in_place        # preserve ACLs/xattrs on the inode
     movzx eax, word ptr [stat_buf + 24]
     and eax, 07777
     mov [temp_mode], rax
-    jmp save_open_temp
-save_default_mode:
+    jmp save_prepare_atomic
+save_new_file:
     mov qword ptr [temp_mode], 0644
+save_prepare_atomic:
+    call copy_temp_filename
+    test rax, rax
+    jne save_failed
 save_open_temp:
     mov rax, SYS_OPEN
     mov rdi, offset temp_name
@@ -2877,6 +3117,16 @@ save_open_temp:
     test rax, rax
     js save_failed
     mov r12, rax
+    cmp qword ptr [save_existing], 0
+    je save_temp_chmod
+    mov rax, SYS_FCHOWN
+    mov rdi, r12
+    mov esi, dword ptr [stat_buf + 28]
+    mov edx, dword ptr [stat_buf + 32]
+    syscall
+    test rax, rax
+    js save_write_failed
+save_temp_chmod:
     mov rax, SYS_FCHMOD
     mov rdi, r12
     mov rsi, [temp_mode]
@@ -2919,9 +3169,64 @@ save_fsync:
     syscall
     test rax, rax
     js save_unlink_failed
+    call fsync_parent_directory
+    test rax, rax
+    jne save_renamed_not_durable
     mov qword ptr [dirty], 0
     xor rax, rax
     ret
+
+# Symlinks, multiply-linked files, and files with extended metadata are written
+# through their existing inode so saving preserves link and metadata semantics.
+save_file_in_place:
+    mov rax, SYS_OPEN
+    mov rdi, offset file_name
+    mov rsi, O_WRONLY | O_TRUNC
+    xor rdx, rdx
+    syscall
+    test rax, rax
+    js save_failed
+    mov r12, rax
+    xor r13, r13
+save_direct_write_loop:
+    cmp r13, [buf_len]
+    jae save_direct_fsync
+    mov rax, SYS_WRITE
+    mov rdi, r12
+    lea rsi, [r14 + r13]
+    mov rdx, [buf_len]
+    sub rdx, r13
+    syscall
+    cmp rax, -ERRNO_EINTR
+    je save_direct_write_loop
+    cmp rax, 0
+    jle save_direct_failed
+    add r13, rax
+    jmp save_direct_write_loop
+save_direct_fsync:
+    mov rax, SYS_FSYNC
+    mov rdi, r12
+    syscall
+    cmp rax, -ERRNO_EINTR
+    je save_direct_fsync
+    test rax, rax
+    js save_direct_failed
+    mov rax, SYS_CLOSE
+    mov rdi, r12
+    syscall
+    test rax, rax
+    js save_failed
+    mov qword ptr [dirty], 0
+    xor rax, rax
+    ret
+save_direct_failed:
+    mov rax, SYS_CLOSE
+    mov rdi, r12
+    syscall
+    jmp save_failed
+
+save_renamed_not_durable:
+    jmp save_failed
 save_write_failed:
     mov rax, SYS_CLOSE
     mov rdi, r12
@@ -2989,6 +3294,72 @@ copy_temp_filename_fail:
     mov rax, 1
     ret
 
+# fsync the containing directory after rename so the new directory entry is
+# durable across a crash or power loss.
+fsync_parent_directory:
+    xor rbx, rbx
+    mov r8, -1
+find_parent_slash:
+    cmp rbx, [file_name_len]
+    jae build_parent_name
+    cmp byte ptr [file_name + rbx], '/'
+    jne find_parent_next
+    mov r8, rbx
+find_parent_next:
+    inc rbx
+    jmp find_parent_slash
+build_parent_name:
+    cmp r8, -1
+    jne parent_has_slash
+    mov byte ptr [dir_name], '.'
+    mov byte ptr [dir_name + 1], 0
+    jmp open_parent_directory
+parent_has_slash:
+    test r8, r8
+    jne copy_parent_name
+    mov byte ptr [dir_name], '/'
+    mov byte ptr [dir_name + 1], 0
+    jmp open_parent_directory
+copy_parent_name:
+    xor rbx, rbx
+copy_parent_loop:
+    cmp rbx, r8
+    jae copy_parent_done
+    mov al, byte ptr [file_name + rbx]
+    mov byte ptr [dir_name + rbx], al
+    inc rbx
+    jmp copy_parent_loop
+copy_parent_done:
+    mov byte ptr [dir_name + rbx], 0
+open_parent_directory:
+    mov rax, SYS_OPEN
+    mov rdi, offset dir_name
+    mov rsi, O_RDONLY | O_DIRECTORY
+    xor rdx, rdx
+    syscall
+    test rax, rax
+    js fsync_parent_failed
+    mov r12, rax
+fsync_parent_loop:
+    mov rax, SYS_FSYNC
+    mov rdi, r12
+    syscall
+    cmp rax, -ERRNO_EINTR
+    je fsync_parent_loop
+    mov r13, rax
+    mov rax, SYS_CLOSE
+    mov rdi, r12
+    syscall
+    test r13, r13
+    js fsync_parent_failed
+    test rax, rax
+    js fsync_parent_failed
+    xor rax, rax
+    ret
+fsync_parent_failed:
+    mov rax, 1
+    ret
+
 # Redraw the whole screen on every key. This is simple but wasteful; acceptable
 # for the editor's small flat-buffer model.
 redraw:
@@ -3027,7 +3398,7 @@ draw_command_status:
     call write_stdout
     mov rsi, offset cmdbuf
     mov rdx, [cmdlen]
-    call write_stdout
+    call write_sanitized
     jmp finish_status_line
 draw_search_status:
     mov rsi, offset status_search
@@ -3035,7 +3406,7 @@ draw_search_status:
     call write_stdout
     mov rsi, offset cmdbuf
     mov rdx, [cmdlen]
-    call write_stdout
+    call write_sanitized
     jmp finish_status_line
 
 draw_status_file:
@@ -3043,7 +3414,7 @@ draw_status_file:
     je draw_status_no_name
     mov rsi, offset file_name
     mov rdx, [file_name_len]
-    call write_stdout
+    call write_sanitized
     jmp draw_status_dirty
 draw_status_no_name:
     mov rsi, offset status_no_name
@@ -3150,7 +3521,8 @@ update_window_done:
 # Compute zero-based logical line and column for the byte cursor.
 compute_cursor_pos:
     xor r8, r8                  # line
-    xor r9, r9                  # column
+    xor r9, r9                  # byte column
+    xor r10, r10                # rendered column
     xor rcx, rcx
     mov rbx, [cursor]
 cursor_pos_loop:
@@ -3159,16 +3531,28 @@ cursor_pos_loop:
     cmp byte ptr [r14 + rcx], 10
     je cursor_pos_newline
     inc r9
+    movzx eax, byte ptr [r14 + rcx]
+    cmp al, 32
+    jb cursor_pos_escaped
+    cmp al, 126
+    ja cursor_pos_escaped
+    inc r10
+    jmp cursor_pos_advance
+cursor_pos_escaped:
+    add r10, 4
+cursor_pos_advance:
     inc rcx
     jmp cursor_pos_loop
 cursor_pos_newline:
     inc r8
     xor r9, r9
+    xor r10, r10
     inc rcx
     jmp cursor_pos_loop
 cursor_pos_done:
     mov [cursor_line], r8
     mov [cursor_col], r9
+    mov [cursor_screen_col], r10
     ret
 
 # Keep the cursor inside the visible line window by adjusting top_line.
@@ -3219,37 +3603,67 @@ write_buffer_view:
     mov rbx, rax                # current byte offset
     xor r13, r13                # rendered lines
     mov r15, [visible_rows]
-    mov r12, rbx                # start of pending byte span
+    xor r10, r10                # rendered columns on this line
 screen_loop:
     cmp r13, r15
-    jae screen_flush_tail
+    jae screen_done
     cmp rbx, [buf_len]
-    jae screen_flush_tail
-    cmp byte ptr [r14 + rbx], 10
+    jae screen_end_line
+    movzx eax, byte ptr [r14 + rbx]
+    cmp al, 10
     je screen_newline
+    cmp r10, [screen_cols]
+    jae screen_skip_byte
+    cmp al, 32
+    jb screen_escaped_byte
+    cmp al, 126
+    ja screen_escaped_byte
+    lea rsi, [r14 + rbx]
+    mov rdx, 1
+    call write_stdout
+    inc r10
+screen_skip_byte:
     inc rbx
     jmp screen_loop
-screen_newline:
-    mov rsi, r14
-    add rsi, r12
-    mov rdx, rbx
-    sub rdx, r12
+
+screen_escaped_byte:
+    mov rdx, [screen_cols]
+    sub rdx, r10
+    cmp rdx, 4
+    jb screen_skip_byte
+    mov r8b, al
+    mov byte ptr [control_buf], '\\'
+    mov byte ptr [control_buf + 1], 'x'
+    movzx eax, r8b
+    mov edx, eax
+    shr eax, 4
+    and edx, 15
+    mov al, byte ptr [hex_digits + rax]
+    mov byte ptr [control_buf + 2], al
+    mov dl, byte ptr [hex_digits + rdx]
+    mov byte ptr [control_buf + 3], dl
+    mov rsi, offset control_buf
+    mov rdx, 4
     call write_stdout
+    add r10, 4
+    inc rbx
+    jmp screen_loop
+
+screen_newline:
     mov rsi, offset status_newline
     mov rdx, status_newline_len
     call write_stdout
     inc r13
     inc rbx
-    mov r12, rbx
+    xor r10, r10
     jmp screen_loop
-screen_flush_tail:
-    mov rsi, r14
-    add rsi, r12
-    mov rdx, rbx
-    sub rdx, r12
+
+# EOF still represents the current logical line, including an empty buffer or
+# the empty segment following a final LF.
+screen_end_line:
+    mov rsi, offset status_newline
+    mov rdx, status_newline_len
     call write_stdout
-    test rdx, rdx
-    je screen_tilde_loop
     inc r13
 screen_tilde_loop:
     cmp r13, r15
@@ -3292,7 +3706,13 @@ place_cursor:
     mov rsi, offset seq_cursor_sep
     mov rdx, 1
     call write_stdout
-    mov rax, [cursor_col]
+    mov rax, [cursor_screen_col]
+    mov rbx, [screen_cols]
+    dec rbx
+    cmp rax, rbx
+    jbe place_cursor_col_ready
+    mov rax, rbx
+place_cursor_col_ready:
     inc rax
     call write_decimal
     mov rsi, offset seq_cursor_suffix
@@ -3354,4 +3774,32 @@ write_stdout_ok:
     pop r12
     pop rbx
 write_done:
+    ret
+
+# Write user-controlled status text without allowing terminal control bytes.
+# Non-ASCII and control bytes are displayed as '?'; file contents use the more
+# descriptive \xNN renderer above.
+write_sanitized:
+    mov r8, rsi
+    mov r9, rdx
+    xor r10, r10
+write_sanitized_loop:
+    cmp r10, r9
+    jae write_sanitized_done
+    movzx eax, byte ptr [r8 + r10]
+    cmp al, 32
+    jb write_sanitized_question
+    cmp al, 126
+    ja write_sanitized_question
+    lea rsi, [r8 + r10]
+    jmp write_sanitized_byte
+write_sanitized_question:
+    mov byte ptr [control_buf], '?'
+    mov rsi, offset control_buf
+write_sanitized_byte:
+    mov rdx, 1
+    call write_stdout
+    inc r10
+    jmp write_sanitized_loop
+write_sanitized_done:
     ret

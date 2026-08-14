@@ -33,6 +33,8 @@ Use `:w file.txt` to name and save an unnamed buffer.
 - Vertical viewport scrolling to keep the cursor visible.
 - `~` markers after end-of-file, like vi.
 - Status display with current line, total lines, and column.
+- Terminal-safe rendering of control/non-ASCII bytes as `\xNN`.
+- Horizontal clipping at the terminal boundary.
 - Movement: `h`, `j`, `k`, `l`, arrow keys, `0`, `^`, `$`, `G`, `nG`,
   `gg`, `ngg`, `w`, `b`, `e`.
 - Counts for movement/editing, such as `5j`, `10j`, `3w`, `5G`, `3x`,
@@ -53,8 +55,8 @@ Use `:w file.txt` to name and save an unnamed buffer.
 - The buffer is dynamic but still byte-oriented; there is no UTF-8 awareness.
 - Only basic ASCII word movement is implemented. Space, tab, and newline are
   treated as word separators.
-- Rendering does not handle horizontal scrolling or line wrapping.
-- Tabs and control characters are not rendered specially.
+- Rendering clips long lines rather than horizontally scrolling them.
+- UTF-8 is editable byte-for-byte but displayed as escaped bytes.
 - There is no multi-level undo, redo, visual mode, or ex-style substitution.
 - File names are limited to 255 bytes.
 - Unexpected crashes can still require `stty sane`; common termination signals

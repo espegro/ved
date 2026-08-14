@@ -83,4 +83,10 @@ This is intentionally small: it keeps the file in a dynamic flat byte buffer
 backed by `mmap`/`mremap`, and editing is still byte-oriented. The display uses
 the terminal height, shows `~` markers after the end of the file, keeps a
 single-line status bar at the bottom with line/column position, and scrolls
-vertically to keep the cursor visible.
+vertically to keep the cursor visible. Long lines are clipped at the terminal
+edge. Non-printable and non-ASCII bytes are shown safely as `\xNN`.
+
+Saving ordinary files uses a temporary sibling, `fsync`, atomic `rename`, and a
+parent-directory `fsync`. Symlinks, hard-linked files, and files carrying
+extended attributes are updated in place so their inode semantics and metadata
+are not silently discarded.
