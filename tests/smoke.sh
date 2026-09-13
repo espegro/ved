@@ -40,10 +40,35 @@ if command -v script >/dev/null 2>&1; then
     test "$(sed -n '1p' "$target")" = "bar bar"
     test "$(sed -n '2p' "$target")" = "bar"
 
+    # Substitution shifts the untouched tail to the correct position whether
+    # the replacement is shorter or longer than the match.
+    printf 'fooXYZ' > "$target"
+    printf ':s/foo/x/\n:wq\n' |
+        timeout 10 script -qefc "./ved $target" /dev/null >/dev/null 2>&1
+    test "$(cat "$target")" = "xXYZ"
+
+    printf 'aXYZ' > "$target"
+    printf ':s/a/long/\n:wq\n' |
+        timeout 10 script -qefc "./ved $target" /dev/null >/dev/null 2>&1
+    test "$(cat "$target")" = "longXYZ"
+
     : > "$target"
     printf 'qaiX\033q@a:wq\n' |
         timeout 10 script -qefc "./ved $target" /dev/null >/dev/null 2>&1
     test "$(cat "$target")" = "XX"
+
+    # A literal q in insert mode is part of the macro; only normal-mode q
+    # terminates recording.
+    : > "$target"
+    printf 'qaiq\033q@a:wq\n' |
+        timeout 10 script -qefc "./ved $target" /dev/null >/dev/null 2>&1
+    test "$(cat "$target")" = "qq"
+
+    # Creation permissions honor the caller's umask.
+    rm -f "$target"
+    (umask 077; printf 'iabc\033:wq\n' |
+        timeout 10 script -qefc "./ved $target" /dev/null >/dev/null 2>&1)
+    test "$(stat -c '%a' "$target")" = "600"
 
     # Leaving insert mode puts the normal-mode cursor on the inserted byte.
     : > "$target"

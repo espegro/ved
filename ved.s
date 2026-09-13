@@ -423,8 +423,11 @@ main_loop:
     je dispatch_key
     cmp qword ptr [macro_replaying], 0
     jne dispatch_key
+    cmp qword ptr [mode], 0
+    jne record_macro_key
     cmp al, 'q'
     je dispatch_key
+record_macro_key:
     mov r15b, al
     mov rax, [macro_recording]
     dec rax
@@ -510,7 +513,7 @@ ensure_dynamic_buffer:
     mov rbx, rdx
     mov rax, [r13]
     cmp rax, rbx
-    jae ensure_dynamic_done
+    jae ensure_dynamic_already_large
     mov rcx, rax
     test rcx, rcx
     jne ensure_dynamic_have_cap
@@ -561,6 +564,9 @@ ensure_dynamic_first_alloc:
     jmp ensure_dynamic_done
 ensure_dynamic_fail:
     mov rax, 1
+    jmp ensure_dynamic_done
+ensure_dynamic_already_large:
+    xor rax, rax
 ensure_dynamic_done:
     pop r15
     pop r13
@@ -2962,6 +2968,7 @@ substitute_shrink_or_equal:
     add rax, r10
     mov rcx, rax
     mov rdx, rbx
+    add rdx, r11
 substitute_shrink_tail:
     cmp rcx, [buf_len]
     jae substitute_shrink_done
@@ -3118,7 +3125,7 @@ save_open_temp:
     js save_failed
     mov r12, rax
     cmp qword ptr [save_existing], 0
-    je save_temp_chmod
+    je save_write_setup
     mov rax, SYS_FCHOWN
     mov rdi, r12
     mov esi, dword ptr [stat_buf + 28]
@@ -3133,6 +3140,7 @@ save_temp_chmod:
     syscall
     test rax, rax
     js save_write_failed
+save_write_setup:
     xor r13, r13
 save_write_loop:
     cmp r13, [buf_len]
